@@ -1,4 +1,4 @@
 streamlit
 pandas
-mip==1.15.0
+mip
 openpyxl
