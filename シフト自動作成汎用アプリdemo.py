@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from mip import *
+import pulp
 import io
 import tempfile
 import os
@@ -88,7 +88,7 @@ if page == "テンプレート作成":
 # ページ② シフト最適化
 # ==============================
 elif page == "シフト最適化":
-    st.title("⚙️ シフト自動作成（MIP版）")
+    st.title("⚙️ シフト自動作成（PuLP版）")
 
     st.markdown("""
     **以下の手順でシフトを最適化します：**  
@@ -110,7 +110,7 @@ elif page == "シフト最適化":
                 inconsistencies.append((d, total_required_staff, total_required_points))
         return inconsistencies
 
-    # ======= 最適化処理 =======
+    # ======= 最適化処理 (PuLP) =======
     def run_shift_optimization(file_path):
         filename = file_path
 
@@ -187,71 +187,110 @@ elif page == "シフト最適化":
                 msg += f"・{d}日目: 必要人数={staff}, 必要点数={points}\n"
             st.warning(msg)
 
+        # --- PuLP モデル定義 ---
+        prob = pulp.LpProblem("ShiftScheduling_4D_PuLP", pulp.LpMinimize)
 
-        model = Model("ShiftScheduling_4D_Penalty_Dev_NoOverstaff")
-        x = {(i, d, t, a): model.add_var(var_type=BINARY) for i in I for d in D for t in T for a in A}
-        shortfall_attr = {(d, a): model.add_var(lb=0) for d in D for a in A}
-        shortfall_pat = {(d, t): model.add_var(lb=0) for d in D for t in T}
-
+        # 決定変数 x[i,d,t,a] ∈ {0,1}
+        x = {}
         for i in I:
             for d in D:
                 for t in T:
                     for a in A:
-                        model += x[i, d, t, a] <= k[i, d]
-                        model += x[i, d, t, a] <= g[i, t]
-            model += xsum(x[i, d, t, a] for d in D for t in T for a in A) >= l_min[i]
-            model += xsum(x[i, d, t, a] for d in D for t in T for a in A) <= l_max[i]
+                        # name safe: convert slashes/spaces if any
+                        name = f"x_{str(i)}_{str(d)}_{str(t)}_{str(a)}"
+                        x[(i, d, t, a)] = pulp.LpVariable(name, cat="Binary")
 
+        # ペナルティ変数（不足吸収）
+        shortfall_attr = {}
+        shortfall_pat = {}
+        for d in D:
+            for a in A:
+                shortfall_attr[(d, a)] = pulp.LpVariable(f"shortfall_attr_{d}_{a}", lowBound=0, cat="Continuous")
+        for d in D:
+            for t in T:
+                shortfall_pat[(d, t)] = pulp.LpVariable(f"shortfall_pat_{d}_{t}", lowBound=0, cat="Continuous")
+
+        # 制約1: 出勤可能日のみ & 勤務可能パターンのみ
+        for i in I:
+            for d in D:
+                for t in T:
+                    for a in A:
+                        prob += x[(i, d, t, a)] <= k.get((i, d), 0)
+                        prob += x[(i, d, t, a)] <= g.get((i, t), 0)
+
+        # 制約2: 勤務日数上下限
+        for i in I:
+            vars_i = [x[(i, d, t, a)] for d in D for t in T for a in A]
+            prob += pulp.lpSum(vars_i) >= l_min.get(i, 0)
+            prob += pulp.lpSum(vars_i) <= l_max.get(i, len(D))
+
+        # 制約3: 5連勤まで
         try:
             D_numeric = sorted([int(d) for d in D])
             for i in I:
                 for idx in range(len(D_numeric) - 4):
                     window_days = D_numeric[idx:idx + 5]
-                    model += xsum(x[i, d, t, a] for d in window_days for t in T for a in A) <= 4
-        except:
+                    prob += pulp.lpSum(x[(i, d, t, a)] for d in window_days for t in T for a in A) <= 4
+        except Exception:
+            # 数値に変換できない場合はスキップ（必要なら日付処理を別実装）
             pass
 
+        # 制約6: 1日に複数勤務禁止（1日1枠）
         for i in I:
             for d in D:
-                model += xsum(x[i, d, t, a] for t in T for a in A) <= 1
+                prob += pulp.lpSum(x[(i, d, t, a)] for t in T for a in A) <= 1
 
+        # 制約5: 属性点数必要量 (緩和 via shortfall_attr)
         for d in D:
             for a in A:
-                model += xsum(x[i, d, t, a]*s[i, a] for i in I for t in T) + shortfall_attr[d, a] >= n[d, a]
-            for t in T:
-                model += xsum(x[i, d, t, a] for i in I for a in A) + shortfall_pat[d, t] >= r[d, t]
-                model += xsum(x[i, d, t, a] for i in I for a in A) <= r[d, t]
+                prob += pulp.lpSum(x[(i, d, t, a)] * s.get((i, a), 0) for i in I for t in T) + shortfall_attr[(d, a)] >= n.get((d, a), 0)
 
-        dev_plus, dev_minus = {}, {}
+        # 制約7: 勤務パターン必要人数 (下限を緩和、上限は r[d,t])
         for d in D:
             for t in T:
-                required = r[d, t]
+                prob += pulp.lpSum(x[(i, d, t, a)] for i in I for a in A) + shortfall_pat[(d, t)] >= r.get((d, t), 0)
+                prob += pulp.lpSum(x[(i, d, t, a)] for i in I for a in A) <= r.get((d, t), len(I))
+
+        # 均等化ペナルティ変数（平均は required/|A| を使う）
+        dev_plus = {}
+        dev_minus = {}
+        for d in D:
+            for t in T:
+                required = r.get((d, t), 0)
                 avg_val = required / max(1, len(A))
                 for a in A:
-                    attr_count = xsum(x[i, d, t, a] for i in I)
-                    dev_plus[d, t, a] = model.add_var(lb=0)
-                    dev_minus[d, t, a] = model.add_var(lb=0)
-                    model += attr_count - avg_val == dev_plus[d, t, a] - dev_minus[d, t, a]
+                    dev_plus[(d, t, a)] = pulp.LpVariable(f"dev_plus_{d}_{t}_{a}", lowBound=0, cat="Continuous")
+                    dev_minus[(d, t, a)] = pulp.LpVariable(f"dev_minus_{d}_{t}_{a}", lowBound=0, cat="Continuous")
+                    attr_count = pulp.lpSum(x[(i, d, t, a)] for i in I)
+                    prob += attr_count - avg_val == dev_plus[(d, t, a)] - dev_minus[(d, t, a)]
 
+        # ペナルティ重み（調整可能）
         P_a, P_t, P_dev = 1000, 500, 50
-        model.objective = minimize(
-            xsum(P_a * shortfall_attr[d, a] for d in D for a in A) +
-            xsum(P_t * shortfall_pat[d, t] for d in D for t in T) +
-            xsum(P_dev * (dev_plus[d, t, a] + dev_minus[d, t, a]) for d in D for t in T for a in A)
+
+        # 目的関数: ペナルティ最小化
+        prob += (
+            pulp.lpSum(P_a * shortfall_attr[(d, a)] for d in D for a in A) +
+            pulp.lpSum(P_t * shortfall_pat[(d, t)] for d in D for t in T) +
+            pulp.lpSum(P_dev * (dev_plus[(d, t, a)] + dev_minus[(d, t, a)]) for d in D for t in T for a in A)
         )
 
-        status = model.optimize()
+        # ソルバー実行（CBC, メッセージOFF）
+        solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=300)
+        result = prob.solve(solver)
+        status = pulp.LpStatus[prob.status]
 
         # === 出力 ===
-        if status in [OptimizationStatus.OPTIMAL, OptimizationStatus.FEASIBLE]:
+        if status in ("Optimal", "Feasible"):
             assignment = {}
             for i in I:
                 for d in D:
                     for t in T:
                         for a in A:
-                            if x[i, d, t, a].x > 0.5:
+                            val = pulp.value(x[(i, d, t, a)])
+                            if val is not None and val > 0.5:
                                 assignment[(i, d)] = (t, a)
 
+            # シフト表
             data = []
             for i in I:
                 row = []
@@ -261,37 +300,43 @@ elif page == "シフト最適化":
                 data.append(row)
             df_shift = pd.DataFrame(data, index=I, columns=D)
 
-            attribute_rows, pattern_rows, total_workdays_rows, dev_rows = [], [], [], []
-
+            # 属性点数確認
+            attribute_rows = []
             for d in D:
                 for a in A:
                     required = n.get((d, a), 0)
-                    assigned = sum(s[i, a] for i in I for t in T if x[i, d, t, a].x > 0.5)
-                    penalty = shortfall_attr[d, a].x or 0
+                    assigned = sum(s.get((i, a), 0) for i in I for t in T if pulp.value(x[(i, d, t, a)]) is not None and pulp.value(x[(i, d, t, a)]) > 0.5)
+                    penalty = pulp.value(shortfall_attr[(d, a)]) or 0
                     attribute_rows.append([d, a, required, assigned, penalty])
             df_attribute = pd.DataFrame(attribute_rows, columns=['日付','属性','必要点数','割当点数','不足ペナルティ'])
 
+            # パターン人数確認
+            pattern_rows = []
             for d in D:
                 for t in T:
-                    required = r[d, t]
-                    assigned = sum(1 for i in I for a in A if x[i, d, t, a].x > 0.5)
-                    penalty = shortfall_pat[d, t].x or 0
+                    required = r.get((d, t), 0)
+                    assigned = sum(1 for i in I for a in A if pulp.value(x[(i, d, t, a)]) is not None and pulp.value(x[(i, d, t, a)]) > 0.5)
+                    penalty = pulp.value(shortfall_pat[(d, t)]) or 0
                     pattern_rows.append([d, t, required, assigned, penalty])
             df_pattern = pd.DataFrame(pattern_rows, columns=['日付','勤務パターン','必要人数','割当人数','不足ペナルティ'])
 
+            # 勤務日数集計
+            total_workdays_rows = []
             for i in I:
-                total_days = sum(1 for d in D for t in T for a in A if x[i, d, t, a].x > 0.5)
+                total_days = sum(1 for d in D for t in T for a in A if pulp.value(x[(i, d, t, a)]) is not None and pulp.value(x[(i, d, t, a)]) > 0.5)
                 total_workdays_rows.append([i, total_days])
             df_total_workdays = pd.DataFrame(total_workdays_rows, columns=['従業員','総勤務日数'])
 
+            # 属性偏り確認
+            dev_rows = []
             for d in D:
                 for t in T:
-                    required = r[d, t]
+                    required = r.get((d, t), 0)
                     avg = required / max(1, len(A))
                     for a in A:
-                        assigned_attr = sum(1 for i in I if x[i, d, t, a].x > 0.5)
-                        dp = dev_plus[d, t, a].x or 0
-                        dm = dev_minus[d, t, a].x or 0
+                        assigned_attr = sum(1 for i in I if pulp.value(x[(i, d, t, a)]) is not None and pulp.value(x[(i, d, t, a)]) > 0.5)
+                        dp = pulp.value(dev_plus[(d, t, a)]) or 0
+                        dm = pulp.value(dev_minus[(d, t, a)]) or 0
                         dev_rows.append([d, t, a, required, assigned_attr, avg, dp, dm])
             df_dev = pd.DataFrame(dev_rows, columns=['日付','勤務パターン','属性','必要人数','割当人数','平均(必要/属性)','偏り+','偏り-'])
 
