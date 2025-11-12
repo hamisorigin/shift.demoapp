@@ -78,6 +78,14 @@ elif page == "シフト最適化":
 
     uploaded_file = st.file_uploader("📤 Excelファイルをアップロード", type=["xlsx"])
 
+    # ✅ ベテラン制約を適用する勤務パターンを入力（空白なら無効）
+    st.markdown("※ 従業員能力値は **1〜10 の範囲で入力してください（10 がベテラン）**")
+    veteran_pattern = st.text_input(
+        "ベテラン（能力10の従業員）を最低1人配置したい勤務パターン（例：遅番）",
+        value="",
+        help="特定の勤務パターンに能力10の人を必ず1人入れたい場合に入力（空白なら無効）"
+    )
+
     def run_shift_optimization(file_path):
         filename = file_path
 
@@ -159,14 +167,13 @@ elif page == "シフト最適化":
         for i in I:
             prob += pulp.lpSum(x[i][d][t][a] for d in D for t in T for a in A) >= l_min[i]
             prob += pulp.lpSum(x[i][d][t][a] for d in D for t in T for a in A) <= l_max[i]
-        
-        # --- 5連勤防止制約（どの5日間でも勤務は4回まで） ---
+
+        # --- 5連勤防止制約 ---
         D_numeric = sorted([int(d) for d in D if str(d).isdigit()])
         for i in I:
             for idx in range(len(D_numeric) - 4):
                 window_days = D_numeric[idx:idx + 5]
                 prob += pulp.lpSum(x[i][d][t][a] for d in window_days for t in T for a in A) <= 4
-
 
         # 1日1勤務
         for i in I:
@@ -183,6 +190,25 @@ elif page == "シフト最適化":
             for t in T:
                 prob += pulp.lpSum(x[i][d][t][a] for i in I for a in A) >= r_min[(d, t)]
                 prob += pulp.lpSum(x[i][d][t][a] for i in I for a in A) - over_t[d][t] <= r_max[(d, t)]
+
+
+        # ✅ ベテラン制約（ユーザー指定）
+        if veteran_pattern.strip() != "":
+            if veteran_pattern not in T:
+                st.warning(f"⚠️ 勤務パターン「{veteran_pattern}」は存在しません。ベテラン制約は無効です。")
+            else:
+                st.info(f"🧩 ベテラン制約を適用中：『{veteran_pattern}』に能力10の人を最低1人配置")
+                for d in D:
+                    for t in T:
+                        if t == veteran_pattern:
+                            for a in A:
+                                capable_workers = [
+                                    i for i in I if s[i, a] == 10 and k[i, d] == 1 and g[i, t] == 1
+                                ]
+                                if capable_workers:
+                                    prob += pulp.lpSum(x[i][d][t][a] for i in capable_workers) >= 1
+        else:
+            st.info("🧩 ベテラン制約は適用されません（入力なし）")
 
         # ✅ 属性偏り制約（復活）
         dev_plus, dev_minus = {}, {}
@@ -207,6 +233,30 @@ elif page == "シフト最適化":
         # --- ソルバー実行 ---
         solver = pulp.PULP_CBC_CMD(msg=False)
         prob.solve(solver)
+
+
+        # --- ペナルティ集計 ---
+        penalty_short = sum(pulp.value(short_a[d][a]) for d in D for a in A)
+        penalty_over = sum(pulp.value(over_t[d][t]) for d in D for t in T)
+        penalty_dev = sum(pulp.value(dev_plus[d, t, a]) + pulp.value(dev_minus[d, t, a]) for d in D for t in T for a in A)
+
+        total_penalty = (
+            200 * penalty_short +
+            100 * penalty_over +
+            50 * penalty_dev
+        )
+
+        # --- Streamlit表示部分 ---
+        st.subheader("📊 ペナルティ集計結果")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("属性不足ペナルティ", f"{penalty_short:.1f}")
+        with col2:
+            st.metric("人数超過ペナルティ", f"{penalty_over:.1f}")
+        with col3:
+            st.metric("偏りペナルティ", f"{penalty_dev:.1f}")
+        with col4:
+            st.metric("総合ペナルティスコア", f"{total_penalty:.1f}")
 
         # --- 出力整形 ---
         assignment = {(i, d): "" for i in I for d in D}
