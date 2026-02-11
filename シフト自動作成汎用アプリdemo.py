@@ -78,6 +78,12 @@ elif page == "シフト最適化":
 
     uploaded_file = st.file_uploader("📤 Excelファイルをアップロード", type=["xlsx"])
 
+    # ✅ 最大連勤数（アプリ内で指定）
+    d_max = st.number_input(
+        "最大連勤数（例：3なら3連勤までOK、4連勤はNG）",
+        min_value=1, max_value=31, value=4, step=1
+    )
+
     # ✅ ベテラン制約を適用する勤務パターンを入力（空白なら無効）
     st.markdown("※ 従業員能力値は **1〜10 の範囲で入力してください（10 がベテラン）**")
     veteran_pattern = st.text_input(
@@ -86,7 +92,7 @@ elif page == "シフト最適化":
         help="特定の勤務パターンに能力10の人を必ず1人入れたい場合に入力（空白なら無効）"
     )
 
-    def run_shift_optimization(file_path):
+    def run_shift_optimization(file_path, d_max):
         filename = file_path
 
         # 共通読み込み関数
@@ -168,12 +174,17 @@ elif page == "シフト最適化":
             prob += pulp.lpSum(x[i][d][t][a] for d in D for t in T for a in A) >= l_min[i]
             prob += pulp.lpSum(x[i][d][t][a] for d in D for t in T for a in A) <= l_max[i]
 
-        # --- 5連勤防止制約 ---
+        # --- 最大連勤数制約（d_max連勤までOK、d_max+1連勤は禁止） ---
+        # どの (d_max+1) 日連続の窓でも、勤務回数は d_max 回まで
         D_numeric = sorted([int(d) for d in D if str(d).isdigit()])
-        for i in I:
-            for idx in range(len(D_numeric) - 4):
-                window_days = D_numeric[idx:idx + 5]
-                prob += pulp.lpSum(x[i][d][t][a] for d in window_days for t in T for a in A) <= 4
+        window_len = int(d_max) + 1
+        if len(D_numeric) >= window_len:
+            for i in I:
+                for idx in range(len(D_numeric) - window_len + 1):
+                    window_days = D_numeric[idx: idx + window_len]
+                    prob += pulp.lpSum(
+                        x[i][d][t][a] for d in window_days for t in T for a in A
+                    ) <= d_max
 
         # 1日1勤務
         for i in I:
@@ -190,7 +201,6 @@ elif page == "シフト最適化":
             for t in T:
                 prob += pulp.lpSum(x[i][d][t][a] for i in I for a in A) >= r_min[(d, t)]
                 prob += pulp.lpSum(x[i][d][t][a] for i in I for a in A) - over_t[d][t] <= r_max[(d, t)]
-
 
         # ✅ ベテラン制約（ユーザー指定）
         if veteran_pattern.strip() != "":
@@ -210,7 +220,7 @@ elif page == "シフト最適化":
         else:
             st.info("🧩 ベテラン制約は適用されません（入力なし）")
 
-        # ✅ 属性偏り制約（復活）
+        # ✅ 属性偏り制約
         dev_plus, dev_minus = {}, {}
         for d in D:
             for t in T:
@@ -234,14 +244,13 @@ elif page == "シフト最適化":
         solver = pulp.PULP_CBC_CMD(msg=False)
         prob.solve(solver)
 
-
         # --- ペナルティ集計 ---
         penalty_short = sum(pulp.value(short_a[d][a]) for d in D for a in A)
         penalty_over = sum(pulp.value(over_t[d][t]) for d in D for t in T)
         penalty_dev = sum(pulp.value(dev_plus[d, t, a]) + pulp.value(dev_minus[d, t, a]) for d in D for t in T for a in A)
 
         total_penalty = (
-            200 * penalty_short +
+            500 * penalty_short +
             100 * penalty_over +
             50 * penalty_dev
         )
@@ -264,24 +273,25 @@ elif page == "シフト最適化":
             for d in D:
                 for t in T:
                     for a in A:
-                        if pulp.value(x[i][d][t][a]) > 0.5:
+                        if pulp.value(x[i][d][t][a]) is not None and pulp.value(x[i][d][t][a]) > 0.5:
                             assignment[(i, d)] = f"{t}-{a}"
 
         df_shift = pd.DataFrame([[assignment[(i, d)] for d in D] for i in I], index=I, columns=D)
 
         # 勤務日数集計
         df_days = pd.DataFrame([
-            [i, sum(1 for d in D for t in T for a in A if pulp.value(x[i][d][t][a]) > 0.5), l_min[i], l_max[i]]
+            [i, sum(1 for d in D for t in T for a in A if pulp.value(x[i][d][t][a]) is not None and pulp.value(x[i][d][t][a]) > 0.5), l_min[i], l_max[i]]
             for i in I
         ], columns=["従業員", "総勤務日数", "下限", "上限"])
         df_days["判定"] = df_days.apply(
-            lambda r: "不足" if r["総勤務日数"] < r["下限"] else ("超過" if r["総勤務日数"] > r["上限"] else "OK"), axis=1
+            lambda r: "不足" if r["総勤務日数"] < r["下限"] else ("超過" if r["総勤務日数"] > r["上限"] else "OK"),
+            axis=1
         )
 
         # 属性点数確認
         df_attr = pd.DataFrame([
             [d, a, n[d, a],
-             sum(s[i, a] for i in I for t in T if pulp.value(x[i][d][t][a]) > 0.5),
+             sum(s[i, a] for i in I for t in T if pulp.value(x[i][d][t][a]) is not None and pulp.value(x[i][d][t][a]) > 0.5),
              pulp.value(short_a[d][a])]
             for d in D for a in A
         ], columns=["日付", "属性", "必要点数", "割当点数", "不足ペナルティ"])
@@ -289,7 +299,7 @@ elif page == "シフト最適化":
         # パターン人数確認
         df_pattern = pd.DataFrame([
             [d, t, r_min[(d, t)], r_max[(d, t)],
-             sum(1 for i in I for a in A if pulp.value(x[i][d][t][a]) > 0.5),
+             sum(1 for i in I for a in A if pulp.value(x[i][d][t][a]) is not None and pulp.value(x[i][d][t][a]) > 0.5),
              pulp.value(over_t[d][t])]
             for d in D for t in T
         ], columns=["日付", "勤務パターン", "下限", "上限", "割当人数", "上限超過ペナルティ"])
@@ -298,8 +308,8 @@ elif page == "シフト最適化":
         df_dev = pd.DataFrame([
             [d, t, a,
              r_min.get((d, t), 0),
-             sum(1 for i in I if pulp.value(x[i][d][t][a]) > 0.5),
-             r_min.get((d, t), 0)/max(1, len(A)),
+             sum(1 for i in I if pulp.value(x[i][d][t][a]) is not None and pulp.value(x[i][d][t][a]) > 0.5),
+             r_min.get((d, t), 0) / max(1, len(A)),
              pulp.value(dev_plus[d, t, a]),
              pulp.value(dev_minus[d, t, a])]
             for d in D for t in T for a in A
@@ -331,14 +341,17 @@ elif page == "シフト最適化":
                 tmp.write(uploaded_file.read())
                 tmp_path = tmp.name
 
-            output, dfs = run_shift_optimization(tmp_path)
+            output, dfs = run_shift_optimization(tmp_path, d_max)
             if output:
                 st.success("✅ 最適化完了！")
-                st.download_button("📥 結果Excelをダウンロード",
-                                   data=output.getvalue(),
-                                   file_name="シフト出力結果.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button(
+                    "📥 結果Excelをダウンロード",
+                    data=output.getvalue(),
+                    file_name="シフト出力結果.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
                 for k, v in dfs.items():
                     st.subheader(k)
                     st.dataframe(v)
+
             os.remove(tmp_path)
